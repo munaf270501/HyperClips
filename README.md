@@ -1,6 +1,10 @@
 <div align="center">
 
-<img src="web/brand/logo.svg" alt="HyperClips" width="260" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="web/brand/logo-light.svg">
+  <source media="(prefers-color-scheme: light)" srcset="web/brand/logo.svg">
+  <img src="web/brand/logo.svg" alt="HyperClips" width="320" />
+</picture>
 
 ### Turn Long Videos & Live Streams into Viral Vertical Shorts — Automatically
 
