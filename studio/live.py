@@ -207,6 +207,25 @@ class Session:
             with self.lock:
                 self.job["preview_frame"] = True
                 self.job["preview_frames"] = len(saved)
+            det = facecam.detect_split_from_frames(saved, ask=brain.look_for_facecam)
+            if det.get("status") == "found":
+                self.set_screens(det["facecam"], det["gamebox"])
+                if self.job.get("creator"):
+                    try:
+                        c = creators.get(self.job["creator"])
+                        if c and not c.get("facecam"):
+                            creators.update(self.job["creator"], {"facecam": det["facecam"], "gamebox": det["gamebox"]})
+                    except ValueError:
+                        pass
+                return
+            if det.get("status") == "none":
+                with self.lock:
+                    self.settings["layout"] = "crop"
+                    self.job.setdefault("options", {})["layout"] = "crop"
+                    self.job["awaiting_screens"] = False
+                jobs.save(self.job)
+                self.screens_ready.set()
+                return
             jobs.save(self.job)
 
     def _ask_ai(self, window=None, why=None):

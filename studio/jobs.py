@@ -627,6 +627,24 @@ def _pause_for_screens(job, d: Path, o: dict, src: dict, video_file: Path = None
         if not saved:
             return False
         (d / "preview.jpg").write_bytes(saved[0])
+        _set(job, stage="Auto-detecting webcam across 4 frames", preview_frame=True, preview_frames=len(saved))
+        det = facecam.detect_split_from_frames(saved, ask=brain.look_for_facecam)
+        if det.get("status") == "found":
+            o["facecam"] = det["facecam"]
+            o["gamebox"] = det["gamebox"]
+            if job.get("creator"):
+                try:
+                    c = creators.get(job["creator"])
+                    if c and not c.get("facecam"):
+                        creators.update(job["creator"], {"facecam": o["facecam"], "gamebox": o["gamebox"]})
+                except ValueError:
+                    pass
+            save(job)
+            return False
+        if det.get("status") == "none":
+            o["layout"] = "crop"
+            save(job)
+            return False
         _set(job, status="pick_screen", stage="Pick your top & bottom screens to start clipping",
              preview_frame=True, preview_frames=len(saved))
         return True

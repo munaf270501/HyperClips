@@ -365,3 +365,121 @@ def detect(path: str | Path, ask=None) -> dict | None:
     if not found:
         return None
     return _finish(path, found[0], w, h, still)
+
+
+def _box_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = a[0], a[1], a[0] + a[2], a[1] + a[3]
+    bx1, by1, bx2, by2 = b[0], b[1], b[0] + b[2], b[1] + b[3]
+    ix, iy = max(0.0, min(ax2, bx2) - max(ax1, bx1)), max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = ix * iy
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return inter / union if union > 1e-6 else 0.0
+
+
+def _trim_webcam_borders(jpeg_bytes: bytes, box: tuple[float, float, float, float], inset: float = 0.05) -> tuple[dict, float]:
+    """Strip any solid/overlay border on the outer 12% of the webcam box, apply a 5% inward safety zoom,
+    and lock the result to exact 3:2 (1080x720) so no outer border or misalignment ever shows."""
+    import io
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+    iw, ih = im.size
+    img_ar = iw / max(1, ih)
+    arr = np.asarray(im, dtype=np.float32)
+
+    x0 = max(0, min(iw - 4, int(round(box[0] * iw))))
+    y0 = max(0, min(ih - 4, int(round(box[1] * ih))))
+    x1 = max(x0 + 4, min(iw, int(round((box[0] + box[2]) * iw))))
+    y1 = max(y0 + 4, min(ih, int(round((box[1] + box[3]) * ih))))
+    crop = arr[y0:y1, x0:x1]
+    ch, cw = crop.shape[:2]
+
+    # Auto edge-trim: strip uniform/solid-color border lines along the outer 12% of each side.
+    if cw >= 24 and ch >= 24:
+        max_x, max_y = max(1, int(cw * 0.12)), max(1, int(ch * 0.12))
+        col_std = crop.std(axis=(0, 2))
+        row_std = crop.std(axis=(1, 2))
+        med_c = float(np.median(col_std)) or 1.0
+        med_r = float(np.median(row_std)) or 1.0
+        dl = dr = dt = db = 0
+        while dl < max_x and col_std[dl] < min(14.0, 0.35 * med_c):
+            dl += 1
+        while dr < max_x and col_std[cw - 1 - dr] < min(14.0, 0.35 * med_c):
+            dr += 1
+        while dt < max_y and row_std[dt] < min(14.0, 0.35 * med_r):
+            dt += 1
+        while db < max_y and row_std[ch - 1 - db] < min(14.0, 0.35 * med_r):
+            db += 1
+        x0, x1, y0, y1 = x0 + dl, x1 - dr, y0 + dt, y1 - db
+
+    # Safety inward zoom (default 5% on each side) so rounded corners & thin edges never bleed in.
+    tw, th = max(8, x1 - x0), max(8, y1 - y0)
+    dx, dy = int(round(tw * inset)), int(round(th * inset))
+    x0, x1 = x0 + dx, max(x0 + dx + 8, x1 - dx)
+    y0, y1 = y0 + dy, max(y0 + dy + 8, y1 - dy)
+
+    # Lock cleanly to 3:2 (1080x720 top panel) centered inside the trimmed webcam interior.
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    tw, th = x1 - x0, y1 - y0
+    target_ar = 1.5
+    if tw / max(1.0, th) > target_ar:
+        tw = th * target_ar
+    else:
+        th = tw / target_ar
+    nx = max(0.0, min(1.0 - tw / iw, (cx - tw / 2.0) / iw))
+    ny = max(0.0, min(1.0 - th / ih, (cy - th / 2.0) / ih))
+    nw = max(0.06, min(1.0 - nx, tw / iw))
+    nh = max(0.06, min(1.0 - ny, th / ih))
+    return {"x": round(nx, 4), "y": round(ny, 4), "w": round(nw, 4), "h": round(nh, 4)}, img_ar
+
+
+def _auto_gamebox(img_ar: float) -> dict:
+    """Clean 9:10 (1080x1200) gameplay crop centered on the frame."""
+    w = min(1.0, 0.9 / max(0.5, img_ar))
+    x = max(0.0, (1.0 - w) / 2.0)
+    return {"x": round(x, 4), "y": 0.0, "w": round(w, 4), "h": 1.0}
+
+
+def detect_split_from_frames(frames_bytes: list[bytes], ask=None, inset: float = 0.05) -> dict:
+    """Multi-frame consensus auto-webcam detector for Split Screen.
+
+    Inspects up to 4 frames via the Vision AI, checks agreement across frames, trims outer overlay borders,
+    applies a 5% inward zoom, and locks to exact 3:2 (Top) + 9:10 (Bottom).
+    Returns:
+      - {"status": "found", "facecam": {...}, "gamebox": {...}}
+      - {"status": "none"}   (confirmed no webcam box — e.g. IRL / pure gameplay)
+      - {"status": "unsure"} (no vision AI or frames disagreed — fall back to 4-frame manual picker)
+    """
+    if not frames_bytes or ask is None:
+        return {"status": "unsure"}
+    boxes: list[tuple[float, float, float, float]] = []
+    no_cam = 0
+    best_jpeg = frames_bytes[0]
+    for raw in frames_bytes[:4]:
+        res = ask(raw) or {}
+        if not res.get("looked"):
+            continue
+        b = res.get("box")
+        if b and len(b) == 4 and b[2] >= 0.06 and b[3] >= 0.06 and b[2] <= 0.65 and b[3] <= 0.65:
+            boxes.append(tuple(float(v) for v in b))
+            best_jpeg = raw
+            # Fast exit once 2 frames agree tightly on the same webcam box
+            if len(boxes) >= 2 and any(_box_iou(boxes[-1], prev) >= 0.60 for prev in boxes[:-1]):
+                break
+        else:
+            no_cam += 1
+            if no_cam >= 2 and not boxes:
+                return {"status": "none"}
+    if not boxes:
+        return {"status": "none"} if no_cam >= 1 else {"status": "unsure"}
+    # Keep the largest agreeing cluster of boxes
+    best_cluster = [boxes[0]]
+    for b in boxes:
+        cl = [o for o in boxes if _box_iou(b, o) >= 0.50]
+        if len(cl) > len(best_cluster):
+            best_cluster = cl
+    if len(boxes) >= 2 and len(best_cluster) < 2:
+        return {"status": "unsure"}
+    med = tuple(float(np.median([b[i] for b in best_cluster])) for i in range(4))
+    fc, img_ar = _trim_webcam_borders(best_jpeg, med, inset=inset)
+    return {"status": "found", "facecam": fc, "gamebox": _auto_gamebox(img_ar)}
